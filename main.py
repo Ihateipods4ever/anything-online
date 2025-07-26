@@ -358,8 +358,10 @@ class DockerCopyWorker(QObject):
             with io.BytesIO() as tar_buffer:
                 for chunk in bits: tar_buffer.write(chunk)
                 tar_buffer.seek(0)
-                with tarfile.open(fileobj=tar_buffer) as tar: tar.extractall(path=temp_dir)
-            self.finished.emit(os.path.join(temp_dir, os.path.basename(self.container_path)))
+                with tarfile.open(fileobj=tar_buffer) as tar:
+                    tar.extractall(path=temp_dir)
+            # The web server expects the root of the temporary directory to serve its contents.
+            self.finished.emit(temp_dir)
         except Exception as e: self.error_received.emit(f"Docker copy error: {e}")
 
 # --- PaaS Deployment Workers ---
@@ -393,14 +395,33 @@ class VercelDeployWorker(QObject):
         try:
             self.log_message.emit("Deploying to Vercel via CLI...")
             command = ["vercel", "--prod", "--yes"]
-            process = subprocess.Popen(command, cwd=self.folder_path, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-            url_found = False
+            process = subprocess.Popen(
+                command,
+                cwd=self.folder_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+
+            output_lines = []
             for line in iter(process.stdout.readline, ''):
-                self.log_message.emit(line.strip())
-                if "Production:" in line:
-                    url = line.split("Production:")[1].strip().split(" ")[0]
-                    self.finished.emit(url); url_found = True
-            if not url_found: self.error_received.emit("Could not find production URL in Vercel CLI output.")
+                stripped_line = line.strip()
+                self.log_message.emit(stripped_line)
+                output_lines.append(stripped_line)
+
+            process.wait()
+
+            if process.returncode == 0:
+                for line in reversed(output_lines):
+                    if "Production:" in line:
+                        url_match = re.search(r'https://\S+', line)
+                        if url_match:
+                            self.finished.emit(url_match.group(0))
+                            return
+                self.error_received.emit("Could not find production URL in Vercel CLI output.")
+            else:
+                self.error_received.emit(f"Vercel CLI failed with exit code {process.returncode}.")
         except FileNotFoundError: self.error_received.emit("Vercel CLI not found. Please run 'npm i -g vercel' and log in.")
         except Exception as e: self.error_received.emit(f"Vercel deployment failed: {e}")
 
@@ -696,7 +717,7 @@ class MainWindow(QMainWindow):
         current_tab_text = self.tab_widget.tabText(self.tab_widget.currentIndex())
         if current_tab_text == "Local Share":
             path = self.local_path_input.text()
-            if not path or not os.path.exists(path): self.log("Error: Please select a valid local path."); self.reset_ui_on_error(); return
+            if not path or not os.path.exists(path): self.log("Error: Please select a valid local path."); self.reset_ui_for_new_action(); return
             self.start_web_server(os.path.dirname(path) if os.path.isfile(path) else path)
         elif current_tab_text == "Remote Share (SSH)":
             self.start_remote_download()
@@ -707,37 +728,37 @@ class MainWindow(QMainWindow):
 
     def start_remote_download(self):
         host, user, remote_path = self.ssh_host_input.text(), self.ssh_user_input.text(), self.ssh_remote_path_input.text()
-        if not all([host, user, remote_path]): self.log("Error: Host, Username, and Remote Path are required."); self.reset_ui_on_error(); return
+        if not all([host, user, remote_path]): self.log("Error: Host, Username, and Remote Path are required."); self.reset_ui_for_new_action(); return
         self.log(f"Connecting to {user}@{host}...")
         worker = SftpDownloadWorker(host, self.ssh_port_spinner.value(), user, self.ssh_pass_input.text() if self.auth_pass_radio.isChecked() else None, self.ssh_key_path_input.text() if self.auth_key_radio.isChecked() else None, remote_path)
         self.start_one_shot_worker(
             worker,
             finished_slot=self.on_data_fetch_complete,
-            error_slot=self.log_and_reset
+            error_slot=self.handle_worker_error
         )
 
     def start_docker_copy(self):
         selected_items = self.docker_volumes_tree.selectedItems()
-        if not selected_items: self.log("Error: Please select a volume to share."); self.reset_ui_on_error(); return
+        if not selected_items: self.log("Error: Please select a volume to share."); self.reset_ui_for_new_action(); return
         container_id, volume_path = self.docker_container_combo.currentData(), selected_items[0].data(0, Qt.ItemDataRole.UserRole)
         self.log(f"Copying '{volume_path}' from container...")
         worker = DockerCopyWorker(container_id, volume_path)
         self.start_one_shot_worker(
             worker,
             finished_slot=self.on_data_fetch_complete,
-            error_slot=self.log_and_reset
+            error_slot=self.handle_worker_error
         )
 
     def start_gdrive_download(self):
         url = self.gdrive_url_input.text()
         if not url or "drive.google.com" not in url:
             self.log("Error: Please provide a valid Google Drive file URL.")
-            self.reset_ui_on_error()
+            self.reset_ui_for_new_action()
             return
         self.log(f"Starting download from: {url}")
         worker = GdriveDownloadWorker(url)
         self.start_one_shot_worker(worker, finished_slot=self.on_data_fetch_complete,
-                                   error_slot=self.log_and_reset, log_slot=self.log)
+                                   error_slot=self.handle_worker_error, log_slot=self.log)
 
     def on_data_fetch_complete(self, temp_dir):        
         self.log(f"Data successfully copied to temporary location: {temp_dir}")
@@ -750,7 +771,7 @@ class MainWindow(QMainWindow):
         self.web_server_thread = QThread()
         self.web_server_worker = WebServerWorker(directory_to_serve, self.port_spinner.value(), username, password)
         self.web_server_worker.moveToThread(self.web_server_thread)
-        self.web_server_worker.server_started.connect(self.on_server_started); self.web_server_worker.error_received.connect(self.log_and_reset)        
+        self.web_server_worker.server_started.connect(self.on_server_started); self.web_server_worker.error_received.connect(self.handle_worker_error)        
         self.web_server_thread.started.connect(self.web_server_worker.run); self.web_server_thread.start()
 
     def on_server_started(self, host, port):
@@ -759,10 +780,10 @@ class MainWindow(QMainWindow):
         self.log(f"Starting {service} tunnel...")
         self.tunnel_thread = QThread()
         worker_class = self.tunnel_worker_map.get(service)
-        if not worker_class: self.log_and_reset(f"Error: Unknown service '{service}'."); return
+        if not worker_class: self.handle_worker_error(f"Error: Unknown service '{service}'."); return
         self.tunnel_worker = worker_class(port)
         self.tunnel_worker.moveToThread(self.tunnel_thread)
-        self.tunnel_worker.url_received.connect(self.on_url_received); self.tunnel_worker.error_received.connect(self.log_and_reset)
+        self.tunnel_worker.url_received.connect(self.on_url_received); self.tunnel_worker.error_received.connect(self.handle_worker_error)
         self.tunnel_thread.started.connect(self.tunnel_worker.run); self.tunnel_thread.start()
 
     def start_paas_deploy(self):
@@ -771,18 +792,18 @@ class MainWindow(QMainWindow):
         worker = None
         if provider == "Netlify":
             token, folder = self.netlify_token_input.text(), self.netlify_folder_input.text()
-            if not token or not folder: self.log("Error: Netlify token and folder required."); self.reset_ui_on_error(); return
+            if not token or not folder: self.log("Error: Netlify token and folder required."); self.reset_ui_for_new_action(); return
             worker = NetlifyDeployWorker(token, folder)
         elif provider == "Vercel":
             folder = self.vercel_folder_input.text()
-            if not folder: self.log("Error: Vercel project folder required."); self.reset_ui_on_error(); return
+            if not folder: self.log("Error: Vercel project folder required."); self.reset_ui_for_new_action(); return
             worker = VercelDeployWorker(folder)
-        else: self.log(f"Deployment for {provider} is not yet implemented."); self.reset_ui_on_error(); return
+        else: self.log(f"Deployment for {provider} is not yet implemented."); self.reset_ui_for_new_action(); return
         
         self.start_one_shot_worker(
             worker,
             finished_slot=self.on_paas_deploy_finished,
-            error_slot=self.log_and_reset,
+            error_slot=self.handle_worker_error,
             log_slot=self.log
         )
 
@@ -795,13 +816,13 @@ class MainWindow(QMainWindow):
         self.log("-----------------------------------------")
         self.log(f"SUCCESS! Your site is live at: {url}")
         self.log("-----------------------------------------")
-        self.reset_ui_on_error()
+        self.reset_ui_for_new_action()
 
-    def log_and_reset(self, error_message):
+    def handle_worker_error(self, error_message):
         self.log(f"ERROR: {error_message}")
         self.stop_all_services()
 
-    def reset_ui_on_error(self):
+    def reset_ui_for_new_action(self):
         self.set_ui_enabled(True)
 
     def stop_all_services(self):
