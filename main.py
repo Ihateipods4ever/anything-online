@@ -2,6 +2,7 @@
 import base64
 import io
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -188,11 +189,23 @@ class LocalTunnelWorker(BaseTunnelWorker):
     def get_not_found_error(self): return "Error: 'lt' not found. Run 'npm install -g localtunnel'."
 
 class ServeoWorker(BaseTunnelWorker):
-    def get_command(self): return ["ssh", "-R", f"80:localhost:{self.port}", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "serveo.net"]
+    def get_command(self):
+        # Use -tt to force pseudo-terminal allocation. This is often necessary
+        # for services like Serveo that expect an interactive-like session to
+        # start properly, preventing the ssh client from exiting immediately.
+        # Use os.devnull for cross-platform compatibility (Windows vs. Unix).
+        return [
+            "ssh", "-tt",
+            "-R", f"80:localhost:{self.port}",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", f"UserKnownHostsFile={os.devnull}",
+            "serveo.net"
+        ]
     def parse_url(self, line):
-        if "Forwarding HTTP traffic from" in line:
-            try: return line.split("from")[1].strip()
-            except IndexError: return None
+        # The -tt option can add terminal escape codes. A regex is more robust.
+        # Example: "Forwarding HTTP traffic from \x1b[1;32mhttps://random.serveo.net\x1b[0m"
+        match = re.search(r'(https://[a-zA-Z0-9-]+\.serveo\.net)', line)
+        return match.group(1) if match else None
     def get_executable_name(self): return "ssh"
 
 # --- Data Source Workers (SSH, Cloud, Docker) ---
@@ -306,7 +319,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Universal Tunneling & Deployment GUI")
-        self.setGeometry(100, 100, 800, 600)
+        # The setGeometry call can sometimes produce a harmless "window move completed without beginning"
+        # warning on some platforms (like macOS). By only setting the size and letting the
+        # window manager decide the initial position, we can often avoid this message.
+        self.resize(800, 600)
+
         self.web_server_thread, self.tunnel_thread, self.data_worker_thread, self.paas_thread = None, None, None, None
         self.web_server_worker, self.tunnel_worker, self.data_worker, self.paas_worker = None, None, None, None
         self.temp_dir_path = None
