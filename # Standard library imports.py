@@ -527,8 +527,8 @@ class MainWindow(QMainWindow):
     def refresh_docker_containers(self):
         if not docker: self.log("Docker SDK not installed. Please run 'pip install docker'."); return
         self.log("Refreshing Docker container list..."); self.docker_refresh_button.setEnabled(False)
-        self.data_worker_thread = QThread()        
-	    # Assign worker to self to prevent it from being garbage collected before it's done.
+        self.data_worker_thread = QThread()
+        # Assign worker to self to prevent it from being garbage collected before it's done.
         self.data_worker = DockerListContainersWorker()
         self.data_worker.moveToThread(self.data_worker_thread)
         self.data_worker.finished.connect(self.on_docker_containers_listed); self.data_worker.error_received.connect(self.log)
