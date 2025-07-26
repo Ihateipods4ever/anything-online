@@ -382,7 +382,8 @@ class NetlifyDeployWorker(QObject):
             zip_buffer.seek(0)
             self.log_message.emit("Uploading to Netlify...")
             headers = {'Content-Type': 'application/zip', 'Authorization': f'Bearer {self.token}'}
-            response = requests.post('https://api.netlify.com/api/v1/sites', headers=headers, data=zip_buffer.read())
+            # Add a timeout for the upload request to prevent hangs
+            response = requests.post('https://api.netlify.com/api/v1/sites', headers=headers, data=zip_buffer.read(), timeout=120)
             response.raise_for_status()
             self.finished.emit(response.json()['url'])
         except Exception as e: self.error_received.emit(f"Netlify deployment failed: {e}")
