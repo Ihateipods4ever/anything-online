@@ -22,6 +22,13 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget
 )
 
+# pty is used to create a pseudo-terminal for the Serveo worker on Unix-like
+# systems, which is necessary to prevent ssh from hanging.
+if sys.platform != 'win32':
+    import pty
+else:
+    pty = None
+
 # --- Optional Dependency Imports ---
 # These are handled as optional and will be set to None if not found.
 # The application will provide feedback to the user if they are needed.
@@ -134,29 +141,52 @@ class BaseTunnelWorker(QObject):
 
     def run(self):
         command = self.get_command()
-        try:
-            self.process = subprocess.Popen(
-                command,
-                # Add stdin=subprocess.DEVNULL to prevent the process from hanging
-                # while waiting for input, which can happen with `ssh -tt`.
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-            )
-            for line in iter(self.process.stdout.readline, ''):
-                if not self._is_running:
-                    break
-                url = self.parse_url(line)
-                if url:
-                    self.url_received.emit(url)
-            self.process.wait()
-        except FileNotFoundError:
-            self.error_received.emit(self.get_not_found_error())
-        except Exception as e:
-            self.error_received.emit(f"{self.get_executable_name()} error: {e}")
-        self.finished.emit()
+        # Serveo on Unix-like systems requires special handling with a pseudo-terminal (pty)
+        # because `ssh -tt` behaves differently without one, often leading to hangs or
+        # output buffering issues that standard PIPE-based subprocesses can't handle.
+        if isinstance(self, ServeoWorker) and pty:
+            try:
+                master, slave = pty.openpty()
+                self.process = subprocess.Popen(
+                    command, stdin=slave, stdout=slave, stderr=slave, text=True, close_fds=True
+                )
+                os.close(slave)  # Close the slave fd in the parent
+
+                # Read from the master fd
+                with os.fdopen(master, 'r') as master_file:
+                    for line in iter(master_file.readline, ''):
+                        if not self._is_running: break
+                        url = self.parse_url(line)
+                        if url: self.url_received.emit(url)
+                self.process.wait()
+            except FileNotFoundError:
+                self.error_received.emit(self.get_not_found_error())
+            except Exception as e:
+                self.error_received.emit(f"{self.get_executable_name()} error: {e}")
+            finally:
+                self.finished.emit()
+        else:
+            # --- Original implementation for other workers and Windows ---
+            try:
+                self.process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                for line in iter(self.process.stdout.readline, ''):
+                    if not self._is_running: break
+                    url = self.parse_url(line)
+                    if url: self.url_received.emit(url)
+                self.process.wait()
+            except FileNotFoundError:
+                self.error_received.emit(self.get_not_found_error())
+            except Exception as e:
+                self.error_received.emit(f"{self.get_executable_name()} error: {e}")
+            self.finished.emit()
 
     def stop(self):
         self._is_running = False
@@ -228,14 +258,71 @@ class SftpDownloadWorker(QObject):
             sftp = client.open_sftp()
             if stat.S_ISDIR(sftp.stat(self.remote_path).st_mode):
                 for item in sftp.listdir(self.remote_path):
-                    remote_item_path = os.path.join(self.remote_path, item).replace("\\", "/")
+                    # Use forward slashes for remote paths, regardless of local OS
+                    remote_item_path = f"{self.remote_path.rstrip('/')}/{item}"
                     local_item_path = os.path.join(temp_dir, item)
                     sftp.get(remote_item_path, local_item_path)
             else:
-                sftp.get(self.remote_path, os.path.join(temp_dir, os.path.basename(self.remote_path)))
+                # Use string splitting for remote paths to avoid OS-specific separator issues
+                sftp.get(self.remote_path, os.path.join(temp_dir, self.remote_path.split('/')[-1]))
             sftp.close(); client.close()
             self.finished.emit(temp_dir)
         except Exception as e: self.error_received.emit(f"SSH/SFTP Error: {e}")
+
+class GdriveDownloadWorker(QObject):
+    """Downloads a publicly shared file from Google Drive."""
+    finished = pyqtSignal(str)
+    error_received = pyqtSignal(str)
+    log_message = pyqtSignal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def _get_confirm_token(self, response):
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                return value
+        return None
+
+    def run(self):
+        if not requests:
+            self.error_received.emit("Google Drive download failed: 'requests' library not found. Please run 'pip install requests'.")
+            return
+        try:
+            # Extract file ID from URL
+            match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', self.url)
+            if not match:
+                self.error_received.emit("Invalid Google Drive URL format. Please use a valid file sharing link.")
+                return
+            file_id = match.group(1)
+            
+            self.log_message.emit(f"Requesting file ID: {file_id} from Google Drive...")
+            session = requests.Session()
+            response = session.get("https://docs.google.com/uc?export=download", params={'id': file_id}, stream=True, timeout=15)
+            response.raise_for_status() # Check for HTTP errors
+            
+            token = self._get_confirm_token(response)
+            if token:
+                self.log_message.emit("Large file warning received, confirming download...")
+                response = session.get("https://docs.google.com/uc?export=download", params={'id': file_id, 'confirm': token}, stream=True, timeout=15)
+                response.raise_for_status()
+
+            temp_dir = tempfile.mkdtemp(prefix="gdrive_")
+            
+            # Safely extract filename from headers, with a fallback
+            filename_match = re.findall('filename="(.+?)"', response.headers.get('content-disposition', ''))
+            if filename_match:
+                filename = filename_match[0]
+            else:
+                filename = f"gdrive_download_{file_id}.dat"
+                self.log_message.emit(f"Could not determine filename from headers. Saving as '{filename}'.")
+
+            with open(os.path.join(temp_dir, filename), "wb") as f:
+                for chunk in response.iter_content(chunk_size=32768):
+                    if chunk: f.write(chunk)
+            self.finished.emit(temp_dir)
+        except Exception as e: self.error_received.emit(f"Google Drive download failed: {e}")
 
 class DockerListContainersWorker(QObject):
     """Lists running Docker containers."""
@@ -432,12 +519,11 @@ class MainWindow(QMainWindow):
 
     def create_cloud_share_tab(self):
         widget = QWidget()
-        layout = QVBoxLayout(widget)
-        label = QLabel("Cloud provider integrations (Google Drive, Dropbox, etc.) were omitted for brevity.\nThis feature can be re-added.")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setWordWrap(True)
-        layout.addWidget(label)
-        widget.setEnabled(False) # Disable the whole tab
+        layout = QFormLayout(widget)
+        self.gdrive_url_input = QLineEdit()
+        self.gdrive_url_input.setPlaceholderText("Paste a public Google Drive file link here...")
+        layout.addRow(QLabel("Google Drive URL:"))
+        layout.addRow(self.gdrive_url_input)
         return widget
 
     def create_container_share_tab(self):
@@ -616,6 +702,8 @@ class MainWindow(QMainWindow):
             self.start_remote_download()
         elif current_tab_text == "Container Share (CaaS)":
             self.start_docker_copy()
+        elif current_tab_text == "Cloud Share (SaaS)":
+            self.start_gdrive_download()
 
     def start_remote_download(self):
         host, user, remote_path = self.ssh_host_input.text(), self.ssh_user_input.text(), self.ssh_remote_path_input.text()
@@ -639,6 +727,17 @@ class MainWindow(QMainWindow):
             finished_slot=self.on_data_fetch_complete,
             error_slot=self.log_and_reset
         )
+
+    def start_gdrive_download(self):
+        url = self.gdrive_url_input.text()
+        if not url or "drive.google.com" not in url:
+            self.log("Error: Please provide a valid Google Drive file URL.")
+            self.reset_ui_on_error()
+            return
+        self.log(f"Starting download from: {url}")
+        worker = GdriveDownloadWorker(url)
+        self.start_one_shot_worker(worker, finished_slot=self.on_data_fetch_complete,
+                                   error_slot=self.log_and_reset, log_slot=self.log)
 
     def on_data_fetch_complete(self, temp_dir):        
         self.log(f"Data successfully copied to temporary location: {temp_dir}")
