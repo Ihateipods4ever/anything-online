@@ -137,6 +137,9 @@ class BaseTunnelWorker(QObject):
         try:
             self.process = subprocess.Popen(
                 command,
+                # Add stdin=subprocess.DEVNULL to prevent the process from hanging
+                # while waiting for input, which can happen with `ssh -tt`.
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -324,9 +327,12 @@ class MainWindow(QMainWindow):
         # window manager decide the initial position, we can often avoid this message.
         self.resize(800, 600)
 
-        self.web_server_thread, self.tunnel_thread, self.data_worker_thread, self.paas_thread = None, None, None, None
-        self.web_server_worker, self.tunnel_worker, self.data_worker, self.paas_worker = None, None, None, None
+        self.web_server_thread, self.tunnel_thread = None, None
+        self.web_server_worker, self.tunnel_worker = None, None
         self.temp_dir_path = None
+        # A list to hold references to temporary, "one-shot" threads to prevent them
+        # from being garbage collected prematurely and to ensure they are cleaned up on exit.
+        self.one_shot_threads = []
         self.tunnel_worker_map = {
             "ngrok": NgrokTunnelWorker,
             "Cloudflare Tunnel": CloudflareTunnelWorker,
@@ -527,12 +533,13 @@ class MainWindow(QMainWindow):
     def refresh_docker_containers(self):
         if not docker: self.log("Docker SDK not installed. Please run 'pip install docker'."); return
         self.log("Refreshing Docker container list..."); self.docker_refresh_button.setEnabled(False)
-        self.data_worker_thread = QThread()        
-	    # Assign worker to self to prevent it from being garbage collected before it's done.
-        self.data_worker = DockerListContainersWorker()
-        self.data_worker.moveToThread(self.data_worker_thread)
-        self.data_worker.finished.connect(self.on_docker_containers_listed); self.data_worker.error_received.connect(self.log)
-        self.data_worker_thread.started.connect(self.data_worker.run); self.data_worker_thread.start()
+        worker = DockerListContainersWorker()
+        self.start_one_shot_worker(
+            worker,
+            finished_slot=self.on_docker_containers_listed,
+            error_slot=self.log,
+            final_slot=lambda: self.docker_refresh_button.setEnabled(True)
+        )
 
     def on_docker_containers_listed(self, containers):
         self.docker_container_combo.clear(); self.docker_volumes_tree.clear()
@@ -547,7 +554,6 @@ class MainWindow(QMainWindow):
                         image_tag = c.image.tags[0]
                 except Exception: pass # Gracefully handle missing image/tags
                 self.docker_container_combo.addItem(f"{c.name} ({image_tag})", c.id)
-        self.docker_refresh_button.setEnabled(True)
 
     def on_docker_container_selected(self, index):
         if index == -1: return
@@ -561,6 +567,35 @@ class MainWindow(QMainWindow):
     def log(self, message):
         """Appends a message to the status output box."""
         self.status_output.append(str(message))
+
+    def start_one_shot_worker(self, worker, finished_slot=None, error_slot=None, log_slot=None, final_slot=None):
+        """Creates, configures, and starts a self-cleaning QThread for a one-shot task."""
+        thread = QThread()
+        worker.moveToThread(thread)
+
+        # --- Self-cleanup connections ---
+        # When the worker is done (success or error), it tells the thread to quit.
+        if hasattr(worker, 'finished'):
+            worker.finished.connect(thread.quit)
+        if hasattr(worker, 'error_received'):
+            worker.error_received.connect(thread.quit)
+
+        # When the thread quits, schedule both thread and worker for safe deletion.
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        # Also remove it from our tracking list when it's done.
+        thread.finished.connect(lambda: self.one_shot_threads.remove(thread) if thread in self.one_shot_threads else None)
+        if final_slot:
+            thread.finished.connect(final_slot)
+
+        # --- Application logic connections ---
+        if finished_slot and hasattr(worker, 'finished'): worker.finished.connect(finished_slot)
+        if error_slot and hasattr(worker, 'error_received'): worker.error_received.connect(error_slot)
+        if log_slot and hasattr(worker, 'log_message'): worker.log_message.connect(log_slot)
+
+        thread.started.connect(worker.run)
+        self.one_shot_threads.append(thread) # Keep a reference to prevent garbage collection
+        thread.start()
 
     def start_action(self):
         self.set_ui_enabled(False)
@@ -585,25 +620,25 @@ class MainWindow(QMainWindow):
     def start_remote_download(self):
         host, user, remote_path = self.ssh_host_input.text(), self.ssh_user_input.text(), self.ssh_remote_path_input.text()
         if not all([host, user, remote_path]): self.log("Error: Host, Username, and Remote Path are required."); self.reset_ui_on_error(); return
-        self.log(f"Connecting to {user}@{host}...")        
-        self.data_worker_thread = QThread()
-        # Assign worker to self to prevent it from being garbage collected before it's done.        
-        self.data_worker = SftpDownloadWorker(host, self.ssh_port_spinner.value(), user, self.ssh_pass_input.text() if self.auth_pass_radio.isChecked() else None, self.ssh_key_path_input.text() if self.auth_key_radio.isChecked() else None, remote_path)
-        self.data_worker.moveToThread(self.data_worker_thread)
-        self.data_worker.finished.connect(self.on_data_fetch_complete); self.data_worker.error_received.connect(self.log_and_reset)
-        self.data_worker_thread.started.connect(self.data_worker.run); self.data_worker_thread.start()
+        self.log(f"Connecting to {user}@{host}...")
+        worker = SftpDownloadWorker(host, self.ssh_port_spinner.value(), user, self.ssh_pass_input.text() if self.auth_pass_radio.isChecked() else None, self.ssh_key_path_input.text() if self.auth_key_radio.isChecked() else None, remote_path)
+        self.start_one_shot_worker(
+            worker,
+            finished_slot=self.on_data_fetch_complete,
+            error_slot=self.log_and_reset
+        )
 
     def start_docker_copy(self):
         selected_items = self.docker_volumes_tree.selectedItems()
         if not selected_items: self.log("Error: Please select a volume to share."); self.reset_ui_on_error(); return
         container_id, volume_path = self.docker_container_combo.currentData(), selected_items[0].data(0, Qt.ItemDataRole.UserRole)
         self.log(f"Copying '{volume_path}' from container...")
-        self.data_worker_thread = QThread()
-        # Assign worker to self to prevent it from being garbage collected before it's done.
-        self.data_worker = DockerCopyWorker(container_id, volume_path)
-        self.data_worker.moveToThread(self.data_worker_thread)
-        self.data_worker.finished.connect(self.on_data_fetch_complete); self.data_worker.error_received.connect(self.log_and_reset)
-        self.data_worker_thread.started.connect(self.data_worker.run); self.data_worker_thread.start()
+        worker = DockerCopyWorker(container_id, volume_path)
+        self.start_one_shot_worker(
+            worker,
+            finished_slot=self.on_data_fetch_complete,
+            error_slot=self.log_and_reset
+        )
 
     def on_data_fetch_complete(self, temp_dir):        
         self.log(f"Data successfully copied to temporary location: {temp_dir}")
@@ -634,20 +669,23 @@ class MainWindow(QMainWindow):
     def start_paas_deploy(self):
         provider = self.paas_provider_combo.currentText()
         self.log(f"Starting deployment to {provider}...")
-        self.paas_thread = QThread()
+        worker = None
         if provider == "Netlify":
             token, folder = self.netlify_token_input.text(), self.netlify_folder_input.text()
             if not token or not folder: self.log("Error: Netlify token and folder required."); self.reset_ui_on_error(); return
-            self.paas_worker = NetlifyDeployWorker(token, folder)
+            worker = NetlifyDeployWorker(token, folder)
         elif provider == "Vercel":
             folder = self.vercel_folder_input.text()
             if not folder: self.log("Error: Vercel project folder required."); self.reset_ui_on_error(); return
-            self.paas_worker = VercelDeployWorker(folder)
+            worker = VercelDeployWorker(folder)
         else: self.log(f"Deployment for {provider} is not yet implemented."); self.reset_ui_on_error(); return
-        self.paas_worker.moveToThread(self.paas_thread)
-        self.paas_worker.finished.connect(self.on_paas_deploy_finished); self.paas_worker.error_received.connect(self.log_and_reset)
-        self.paas_worker.log_message.connect(self.log)
-        self.paas_thread.started.connect(self.paas_worker.run); self.paas_thread.start()
+        
+        self.start_one_shot_worker(
+            worker,
+            finished_slot=self.on_paas_deploy_finished,
+            error_slot=self.log_and_reset,
+            log_slot=self.log
+        )
 
     def on_url_received(self, url):
         self.log("-----------------------------------------")
@@ -671,24 +709,27 @@ class MainWindow(QMainWindow):
         self.log("Stopping all services...")
 
         # Stop workers first to signal them to finish their tasks.
-        if self.tunnel_worker: self.tunnel_worker.stop()        
+        if self.tunnel_worker: self.tunnel_worker.stop()
         if self.web_server_worker: self.web_server_worker.stop()
-        # Data and PaaS workers are short-lived and don't have stop methods,
-        # but we must wait for their threads to finish cleanly.
 
         # Gracefully quit and wait for all threads to terminate. This prevents the
         # "QThread: Destroyed while thread is still running" error.
         threads_to_wait = [
-            (self.tunnel_thread, "Tunnel"), (self.web_server_thread, "Web Server"),
-            (self.data_worker_thread, "Data Worker"), (self.paas_thread, "PaaS Worker")
+            (self.tunnel_thread, "Tunnel"),
+            (self.web_server_thread, "Web Server"),
         ]
+        # Add any active one-shot threads to the list of threads to wait for.
+        for i, thread in enumerate(self.one_shot_threads):
+            threads_to_wait.append((thread, f"One-shot Worker {i+1}"))
+
         for thread, name in threads_to_wait:
             if thread and thread.isRunning():
                 thread.quit()
                 if not thread.wait(3000): # Wait up to 3 seconds
                     self.log(f"Warning: {name} thread did not terminate gracefully.")
                     thread.terminate() # Forcefully stop if it doesn't respond
-
+        
+        self.one_shot_threads.clear()
         if self.temp_dir_path:
             shutil.rmtree(self.temp_dir_path, ignore_errors=True)
             self.log(f"Cleaned up temporary directory: {self.temp_dir_path}")
